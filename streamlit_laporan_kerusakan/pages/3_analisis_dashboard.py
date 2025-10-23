@@ -1,0 +1,345 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from datetime import datetime
+import numpy as np 
+from database import db
+
+# --- Logika Autentikasi Halaman ---
+if 'logged_in' not in st.session_state or not st.session_state.logged_in:
+    st.error("Anda harus login untuk mengakses halaman ini. Silakan kembali ke halaman utama.")
+    st.stop() 
+
+# --- Fungsi Pembantu: Parsing Tanggal ---
+DATE_FORMAT = '%d/%m/%Y'
+
+def parse_date(date_str):
+    if pd.isna(date_str) or str(date_str).strip() == '':
+        return pd.NaT
+    for fmt in ['%m/%d/%Y', '%d/%m/%Y', '%Y-%m-%d', '%y-%m-%d', '%Y/%m/%d', DATE_FORMAT]:
+        try:
+            return datetime.strptime(str(date_str).strip(), fmt)
+        except (ValueError, TypeError):
+            continue
+    return pd.NaT
+
+# --- Fungsi Manajemen Data ---
+def load_data_dashboard():
+    """Memuat SEMUA data dari SQLite dan melakukan pre-processing untuk analisis GLOBAL."""
+    try:
+        df = db.get_dashboard_data()
+    except Exception as e:
+        st.error(f"Gagal memuat data dari database: {e}")
+        return pd.DataFrame()
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Data cleaning dan processing
+    df['vessel'] = df['vessel'].astype(str).str.upper().str.strip()
+    df['status'] = df.get('status', 'OPEN').astype(str).str.upper()
+    df['unit'] = df['unit'].astype(str).str.upper().str.strip().fillna('TIDAK DITENTUKAN')
+
+    # Konversi tanggal
+    df['Date_Day'] = df['day'].apply(parse_date)
+    df['Date_Issue'] = df['issued_date'].apply(parse_date)
+    df['Date_Closed'] = df['closed_date'].apply(parse_date) 
+
+    # Hapus baris di mana Date_Day tidak valid atau Vessel kosong
+    df = df.dropna(subset=['Date_Day', 'vessel']).reset_index(drop=True)
+    
+    # Hitung Resolution Time (MTTR) dengan hari kalender INKLUSIF (+1)
+    df['Resolution_Time_Days'] = (df['Date_Closed'] - df['Date_Issue']).dt.days + 1
+    
+    # Bersihkan Resolution_Time_Days yang tidak valid
+    df.loc[df['Resolution_Time_Days'] <= 0, 'Resolution_Time_Days'] = np.nan
+    
+    return df
+
+# --- Fungsi Callback untuk Tombol Select/Clear All ---
+def toggle_all_vessels():
+    all_vessels = st.session_state.all_vessels_list
+    current_selection = st.session_state.filter_vessel_dashboard
+    
+    if len(current_selection) == len(all_vessels):
+        # Jika semua sudah terpilih, clear selection
+        st.session_state.filter_vessel_dashboard = []
+    else:
+        # Jika belum semua terpilih, pilih semua
+        st.session_state.filter_vessel_dashboard = all_vessels
+
+# --- Tampilan Utama Dashboard ---
+
+st.title("📊 Dashboard Analisis Kerusakan Kapal (Global)")
+
+df = load_data_dashboard()
+
+if df.empty:
+    st.info("Data laporan kerusakan tidak ditemukan atau kosong. Silakan input data di halaman Laporan Aktif & Input.")
+    st.stop() 
+
+# --- Filter Global Tahun dan Kapal ---
+valid_years = df['Date_Day'].dt.year.dropna().astype(int).unique()
+year_options = ['All'] + sorted(valid_years.tolist(), reverse=True)
+all_vessels = sorted(df['vessel'].dropna().unique().tolist())
+
+# Inisialisasi session state untuk daftar kapal global jika belum ada
+if 'all_vessels_list' not in st.session_state:
+    st.session_state.all_vessels_list = all_vessels
+
+with st.container(border=True): 
+    
+    col_filter_year, col_filter_vessel_select, col_spacer_top = st.columns([1, 2.7, 1.3])
+    
+    with col_filter_year:
+        selected_year = st.selectbox("Filter Tahun Kejadian", year_options, key="filter_tahun_dashboard")
+        
+    with col_filter_vessel_select:
+        st.markdown("Kapal (Pilih 1 atau Lebih) - **Global View**")
+        selected_vessels = st.multiselect(
+            "Filter Kapal (Pilih 1 atau Lebih)",
+            options=all_vessels, 
+            default=all_vessels, 
+            key="filter_vessel_dashboard",
+            label_visibility='collapsed'
+        )
+        
+        st.button(
+            "🔄 Pilih Semua / Bersihkan", 
+            on_click=toggle_all_vessels, 
+            use_container_width=True
+        )
+
+    # Filter data utama
+    df_filtered = df.copy()
+    
+    # Filter berdasarkan Tahun
+    if selected_year and selected_year != 'All':
+        df_filtered = df_filtered[df_filtered['Date_Day'].dt.year == int(selected_year)]
+
+    # Filter berdasarkan Kapal
+    if selected_vessels:
+        df_filtered = df_filtered[df_filtered['vessel'].isin(selected_vessels)]
+    else:
+        df_filtered = pd.DataFrame()
+
+    # === Bagian 1: Ringkasan Metrik & KPI ===
+    if df_filtered.empty:
+        total = open_count = closed_count = 0
+        avg_res_time = "N/A"
+    else:
+        total = len(df_filtered)
+        open_count = len(df_filtered[df_filtered['status'] == 'OPEN'])
+        closed_count = len(df_filtered[df_filtered['status'] == 'CLOSED'])
+        
+        df_closed = df_filtered[df_filtered['status'] == 'CLOSED'].copy()
+        if not df_closed.empty and df_closed['Resolution_Time_Days'].notna().any():
+            avg_res_time = df_closed[df_closed['Resolution_Time_Days'] > 0]['Resolution_Time_Days'].mean() 
+        else:
+            avg_res_time = "N/A"
+
+    st.markdown("##### Ringkasan Status Laporan (Total: **{}**) - Data real-time".format(total))
+    
+    col_open, col_closed, col_avg_days_res = st.columns(3) 
+
+    col_open.metric("Laporan Masih OPEN", open_count)
+    col_closed.metric("Laporan Sudah CLOSED", closed_count)
+    
+    col_avg_days_res.metric("Avg. Waktu Penyelesaian (MTTR)", f"{avg_res_time:,.1f} Hari" if avg_res_time != "N/A" else "N/A")
+
+st.markdown("---")
+
+# =========================================================
+# === Bagian 2: Analisis Detail Menggunakan Tabs ===
+# =========================================================
+
+tab_unit, tab_vessel, tab_time, tab_kpi = st.tabs(["📊 Analisis Unit/Sistem", "⚓ Kinerja Kapal", "📈 Tren Kerusakan", "🏆 Metrik Efisiensi (MTTR)"])
+
+# --- Cek data kosong global untuk semua tab ---
+if df_filtered.empty:
+    with tab_unit: st.info("Tidak ada data untuk kombinasi filter yang dipilih.")
+    with tab_vessel: st.info("Tidak ada data untuk kombinasi filter yang dipilih.")
+    with tab_time: st.info("Tidak ada data untuk kombinasi filter yang dipilih.")
+    with tab_kpi: st.info("Tidak ada data untuk kombinasi filter yang dipilih.")
+    st.stop()
+
+# --- TAB 1: ANALISIS UNIT/SISTEM ---
+with tab_unit:
+    st.subheader("Penyebaran Kerusakan berdasarkan Unit/Sistem")
+    
+    col_bar, col_spacer, col_pie = st.columns([2, 0.1, 1])
+
+    unit_counts = df_filtered['unit'].value_counts().reset_index()
+    unit_counts.columns = ['Unit', 'Jumlah Kerusakan']
+    
+    fig_unit_bar = px.bar(
+        unit_counts.head(10).sort_values(by='Jumlah Kerusakan', ascending=True),
+        x='Jumlah Kerusakan',
+        y='Unit', 
+        title='Top 10 Unit Paling Bermasalah',
+        color='Jumlah Kerusakan',
+        color_continuous_scale=px.colors.sequential.Sunset,
+        orientation='h'
+    )
+    fig_unit_bar.update_layout(xaxis_title="Jumlah Kerusakan", yaxis_title="")
+    col_bar.plotly_chart(fig_unit_bar, use_container_width=True)
+    
+    top_units = unit_counts['Unit'].head(5).tolist()
+    if top_units:
+        df_top_unit = df_filtered[df_filtered['unit'].isin(top_units)]
+        
+        status_counts_top_unit = df_top_unit['status'].value_counts().reset_index()
+        status_counts_top_unit.columns = ['Status', 'Count']
+        
+        fig_unit_pie = px.pie(
+            status_counts_top_unit,
+            values='Count',
+            names='Status',
+            title=f'Status Laporan pada Top {len(top_units)} Unit',
+            hole=0.3,
+            color_discrete_map={'OPEN':'red', 'CLOSED':'green'}
+        )
+        col_pie.plotly_chart(fig_unit_pie, use_container_width=True)
+    else:
+        col_pie.info("Tidak cukup data untuk analisis Top Unit.")
+
+# --- TAB 2: KINERJA KAPAL ---
+with tab_vessel:
+    st.subheader("Analisis Kinerja Kerusakan per Kapal")
+
+    vessel_counts = df_filtered['vessel'].value_counts().reset_index()
+    vessel_counts.columns = ['Vessel', 'Total Kerusakan']
+    
+    fig_vessel_bar = px.bar(
+        vessel_counts.sort_values(by='Total Kerusakan', ascending=True),
+        x='Total Kerusakan',
+        y='Vessel',
+        title='Total Kerusakan Berdasarkan Kapal',
+        color='Total Kerusakan',
+        color_continuous_scale=px.colors.sequential.Viridis,
+        orientation='h'
+    )
+    fig_vessel_bar.update_layout(xaxis_title="Jumlah Kerusakan", yaxis_title="")
+    st.plotly_chart(fig_vessel_bar, use_container_width=True)
+
+    st.markdown("##### Laporan OPEN Terbanyak per Kapal")
+    df_vessel_open = df_filtered[df_filtered['status'] == 'OPEN']
+    vessel_open_counts = df_vessel_open.groupby('vessel').size().sort_values(ascending=False).reset_index(name='Jumlah OPEN')
+    
+    st.data_editor(
+        vessel_open_counts,
+        column_config={
+            "Jumlah OPEN": st.column_config.NumberColumn(
+                "Jumlah OPEN",
+                format="%d", 
+                help="Total laporan yang masih OPEN",
+                width="small" 
+            )
+        },
+        column_order=['vessel', 'Jumlah OPEN'],
+        hide_index=True,
+        use_container_width=True,
+        disabled=True 
+    )
+
+# --- TAB 3: TREN KERUSAKAN ---
+with tab_time:
+    st.subheader("Tren Laporan Kerusakan dari Waktu ke Waktu")
+    
+    df_filtered['Month'] = df_filtered['Date_Day'].dt.to_period('M')
+    
+    monthly_trend = df_filtered.groupby(['Month', 'status']).size().reset_index(name='Jumlah')
+    monthly_trend['Month'] = monthly_trend['Month'].astype(str)
+    
+    fig_trend = px.line(
+        monthly_trend,
+        x='Month',
+        y='Jumlah',
+        color='status',
+        title='Tren Laporan OPEN vs CLOSED per Bulan',
+        markers=True,
+        color_discrete_map={'OPEN':'red', 'CLOSED':'green'}
+    )
+    fig_trend.update_layout(xaxis_title="Bulan", yaxis_title="Jumlah Laporan")
+    st.plotly_chart(fig_trend, use_container_width=True)
+    
+    st.markdown("##### Timeline 15 Permasalahan Aktif (OPEN) Terlama")
+    
+    df_open_timeline = df_filtered[df_filtered['status'] == 'OPEN'].copy()
+    
+    if not df_open_timeline.empty:
+        df_open_timeline['Duration'] = (datetime.now() - df_open_timeline['Date_Day']).dt.days
+        df_open_timeline = df_open_timeline.sort_values('Duration', ascending=False).head(15).copy()
+        
+        df_open_timeline['Current_Time'] = datetime.now()
+        
+        df_open_timeline['Label'] = df_open_timeline['vessel'] + ' - ' + df_open_timeline['permasalahan'].str.slice(0, 30) + '...'
+
+        fig_timeline = px.timeline(
+            df_open_timeline,
+            x_start="Date_Day",
+            x_end="Current_Time", 
+            y="Label",
+            color="vessel",
+            title="Timeline Durasi 15 Laporan OPEN Terlama",
+            text="Duration"
+        )
+        fig_timeline.update_yaxes(autorange="reversed") 
+        fig_timeline.update_traces(textposition='inside', marker_line_width=0, opacity=0.8) 
+        fig_timeline.update_layout(xaxis_title="Tanggal", yaxis_title="")
+        st.plotly_chart(fig_timeline, use_container_width=True)
+    else:
+        st.info("Tidak ada laporan yang berstatus OPEN dalam kombinasi filter ini.")
+
+# --- TAB 4: METRIK EFISIENSI (MTTR) ---
+with tab_kpi:
+    st.subheader("🏆 Metrik Efisiensi Perbaikan (MTTR)")
+    
+    df_closed_mttr = df_filtered[df_filtered['status'] == 'CLOSED'].copy()
+
+    if not df_closed_mttr.empty:
+        # 1. Hitung MTTR (rata-rata Resolution_Time_Days) per Unit
+        mttr_unit = df_closed_mttr.groupby('unit')['Resolution_Time_Days'].mean().reset_index(name='MTTR (Hari)')
+
+        # 2. Hitung Jumlah Kerusakan (untuk konteks)
+        failure_counts = df_filtered.groupby('unit').size().reset_index(name='Jumlah Kerusakan')
+        
+        # 3. Gabungkan dan sort
+        mttr_display = pd.merge(mttr_unit, failure_counts, on='unit', how='left').fillna({'Jumlah Kerusakan': 0})
+        
+        # SORTING: Diurutkan dari yang tercepat (MTTR terkecil/Ascending)
+        mttr_display = mttr_display.sort_values(by='MTTR (Hari)', ascending=True).reset_index(drop=True)
+
+        st.info("Analisis **MTTR (Mean Time to Repair)** dihitung dari laporan yang sudah CLOSED dan diurutkan berdasarkan **waktu perbaikan tercepat**.")
+
+        st.markdown("##### 1. Efisiensi Perbaikan (MTTR) per Unit (Tercepat ke Terlambat)")
+        
+        st.data_editor(
+            mttr_display,
+            column_config={
+                "MTTR (Hari)": st.column_config.NumberColumn(
+                    "MTTR (Hari)",
+                    format="%.1f",
+                    help="Rata-rata Waktu yang dibutuhkan untuk menutup laporan (Semakin Kecil, Semakin Cepat Perbaikan)"
+                ),
+                "Jumlah Kerusakan": st.column_config.NumberColumn(
+                    "Total Kerusakan", 
+                    format="%d",
+                    width="small"
+                )
+            },
+            column_order=['unit', 'MTTR (Hari)', 'Jumlah Kerusakan'],
+            hide_index=True,
+            use_container_width=True,
+            disabled=True
+        )
+    else:
+        st.warning("Tidak ada laporan yang berstatus CLOSED dalam kombinasi filter ini, sehingga MTTR per Unit tidak dapat dihitung.")
+
+# --- PERBAIKAN: Tambahkan tombol refresh ---
+st.markdown("---")
+if st.button("🔄 Refresh Dashboard", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+st.info("ℹ️ Dashboard menampilkan data real-time dari database. Gunakan tombol refresh untuk data terbaru.")
